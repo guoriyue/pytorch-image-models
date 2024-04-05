@@ -470,21 +470,16 @@ def main():
             model = NativeDDP(model, device_ids=[args.local_rank], broadcast_buffers=not args.no_ddp_bb)
         # NOTE: EMA model does not need to be wrapped by DDP
 
-    def encode_and_decode(state: object, bucket: dist.GradBucket) -> torch.futures.Future[torch.Tensor]:
-        print('encode_and_decode')
-        encoded_tensor = bucket.buffer()  # encode gradients
-        fut = torch.distributed.all_reduce(encoded_tensor).get_future()
-        # Define the then callback to decode.
-        def decode(fut):
-            decoded_tensor = fut.value()[0]  # decode gradients
-            return decoded_tensor
-        return fut.then(decode)
     
-    def noop(state: object, bucket: dist.GradBucket) -> torch.futures.Future[torch.Tensor]:
+    def sparse_grad(state: object, bucket: dist.GradBucket) -> torch.futures.Future[torch.Tensor]:
         fut = torch.futures.Future()
-        fut.set_result(bucket.buffer())
+        p = bucket.buffer()
+        # torch.distributed.all_reduce(p, op=torch.distributed.ReduceOp.AVG)
+        zero_tensor = torch.zeros_like(p)
+        fut.set_result(zero_tensor)
         return fut
-    model.register_comm_hook(state=None, hook=noop)
+
+    model.register_comm_hook(state=None, hook=sparse_grad)
             
     # model.register_comm_hook(state=None, hook=encode_and_decode)
     # setup learning rate schedule and starting epoch
@@ -720,10 +715,12 @@ def train_one_epoch(
                 dispatch_clip_grad(
                     model_parameters(model, exclude_head='agc' in args.clip_mode),
                     value=args.clip_grad, mode=args.clip_mode)
-            # for name, param in model.named_parameters():
-            #     dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+            
+            # sync and see the gradients
+            torch.cuda.synchronize()
+            for name, param in model.named_parameters():
+                print(name, param.grad)
             optimizer.step()
-            # print("optimizer step done")
 
         if model_ema is not None:
             model_ema.update(model)
