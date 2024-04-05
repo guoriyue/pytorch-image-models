@@ -479,8 +479,7 @@ def main():
         return fut
 
     model.register_comm_hook(state=None, hook=sparse_grad)
-            
-    # model.register_comm_hook(state=None, hook=encode_and_decode)
+    
     # setup learning rate schedule and starting epoch
     lr_scheduler, num_epochs = create_scheduler(args, optimizer)
     start_epoch = 0
