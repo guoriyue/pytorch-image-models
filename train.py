@@ -36,7 +36,7 @@ from timm.loss import *
 from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler
 from timm.utils import ApexScaler, NativeScaler
-
+import torch.distributed as dist
 try:
     from apex import amp
     from apex.parallel import DistributedDataParallel as ApexDDP
@@ -126,7 +126,8 @@ parser.add_argument('--clip-grad', type=float, default=None, metavar='NORM',
 parser.add_argument('--clip-mode', type=str, default='norm',
                     help='Gradient clipping mode. One of ("norm", "value", "agc")')
 
-
+parser.add_argument('--subsample-fraction', default = 1, type = float, 
+                        help = 'if use only a fraction of the dataset, set this to be the fraction') 
 # Learning rate schedule parameters
 parser.add_argument('--sched', default='cosine', type=str, metavar='SCHEDULER',
                     help='LR scheduler (default: "step"')
@@ -286,7 +287,7 @@ parser.add_argument('--eval-metric', default='top1', type=str, metavar='EVAL_MET
                     help='Best metric (default: "top1"')
 parser.add_argument('--tta', type=int, default=0, metavar='N',
                     help='Test/inference time augmentation (oversampling) factor. 0=None (default: 0)')
-parser.add_argument("--local_rank", default=0, type=int)
+parser.add_argument("--local-rank", default=0, type=int)
 parser.add_argument('--use-multi-epochs-loader', action='store_true', default=False,
                     help='use the multi-epochs-loader to save time at the beginning of every epoch')
 parser.add_argument('--torchscript', dest='torchscript', action='store_true',
@@ -330,6 +331,7 @@ def main():
     args.device = 'cuda:0'
     args.world_size = 1
     args.rank = 0  # global rank
+    # args.distributed 
     if args.distributed:
         args.device = 'cuda:%d' % args.local_rank
         torch.cuda.set_device(args.local_rank)
@@ -468,6 +470,23 @@ def main():
             model = NativeDDP(model, device_ids=[args.local_rank], broadcast_buffers=not args.no_ddp_bb)
         # NOTE: EMA model does not need to be wrapped by DDP
 
+    def encode_and_decode(state: object, bucket: dist.GradBucket) -> torch.futures.Future[torch.Tensor]:
+        print('encode_and_decode')
+        encoded_tensor = bucket.buffer()  # encode gradients
+        fut = torch.distributed.all_reduce(encoded_tensor).get_future()
+        # Define the then callback to decode.
+        def decode(fut):
+            decoded_tensor = fut.value()[0]  # decode gradients
+            return decoded_tensor
+        return fut.then(decode)
+    
+    def noop(state: object, bucket: dist.GradBucket) -> torch.futures.Future[torch.Tensor]:
+        fut = torch.futures.Future()
+        fut.set_result(bucket.buffer())
+        return fut
+    model.register_comm_hook(state=None, hook=noop)
+            
+    # model.register_comm_hook(state=None, hook=encode_and_decode)
     # setup learning rate schedule and starting epoch
     lr_scheduler, num_epochs = create_scheduler(args, optimizer)
     start_epoch = 0
@@ -662,13 +681,18 @@ def train_one_epoch(
     losses_m = AverageMeter()
 
     model.train()
-
+    last_batch_idx = len(loader) - 1
     end = time.time()
     last_idx = len(loader) - 1
     num_updates = epoch * len(loader)
     for batch_idx, (input, target) in enumerate(loader):
         last_batch = batch_idx == last_idx
         data_time_m.update(time.time() - end)
+        if args.subsample_fraction is not None: 
+             # don't for get to comment out
+            if batch_idx >= args.subsample_fraction * last_batch_idx:
+                print("dataset subsampling disabled, batch idx breaking at {}".format(batch_idx)) 
+                break
         if not args.prefetcher:
             input, target = input.cuda(), target.cuda()
             if mixup_fn is not None:
@@ -696,7 +720,10 @@ def train_one_epoch(
                 dispatch_clip_grad(
                     model_parameters(model, exclude_head='agc' in args.clip_mode),
                     value=args.clip_grad, mode=args.clip_mode)
+            # for name, param in model.named_parameters():
+            #     dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
             optimizer.step()
+            # print("optimizer step done")
 
         if model_ema is not None:
             model_ema.update(model)
