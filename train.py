@@ -474,9 +474,8 @@ def main():
     def sparse_grad(state: object, bucket: dist.GradBucket) -> torch.futures.Future[torch.Tensor]:
         fut = torch.futures.Future()
         p = bucket.buffer()
-        # torch.distributed.all_reduce(p, op=torch.distributed.ReduceOp.AVG)
-        zero_tensor = torch.zeros_like(p)
-        fut.set_result(zero_tensor)
+        torch.distributed.all_reduce(p, op=torch.distributed.ReduceOp.AVG)
+        fut.set_result(p)
         return fut
 
     model.register_comm_hook(state=None, hook=sparse_grad)
