@@ -58,6 +58,9 @@ try:
 except ImportError: 
     has_wandb = False
 
+from memory import DGCSGDMemory
+from sparse_hook import PowerSGDState, powerSGD_hook
+from sparse_dist import SparseDistributedDataParallel
 torch.backends.cudnn.benchmark = True
 _logger = logging.getLogger('train')
 
@@ -126,8 +129,6 @@ parser.add_argument('--clip-grad', type=float, default=None, metavar='NORM',
 parser.add_argument('--clip-mode', type=str, default='norm',
                     help='Gradient clipping mode. One of ("norm", "value", "agc")')
 
-parser.add_argument('--subsample-fraction', default = 1, type = float, 
-                        help = 'if use only a fraction of the dataset, set this to be the fraction') 
 # Learning rate schedule parameters
 parser.add_argument('--sched', default='cosine', type=str, metavar='SCHEDULER',
                     help='LR scheduler (default: "step"')
@@ -294,6 +295,13 @@ parser.add_argument('--torchscript', dest='torchscript', action='store_true',
                     help='convert model torchscript for inference')
 parser.add_argument('--log-wandb', action='store_true', default=False,
                     help='log training and validation metrics to wandb')
+
+parser.add_argument('--subsample-fraction', default = 1, type = float, 
+                        help = 'if use only a fraction of the dataset, set this to be the fraction') 
+parser.add_argument('--top-k', default = 0.05, type = float, help = 'top-k to communicate') 
+parser.add_argument("--blockwise-flag", action = 'store_true', default = False) 
+parser.add_argument("--elementwise-flag", action = 'store_true', default = False) 
+parser.add_argument("--random-flag", action = 'store_true', default = False)
 
 
 def _parse_args():
@@ -467,14 +475,72 @@ def main():
         else:
             if args.local_rank == 0:
                 _logger.info("Using native Torch DistributedDataParallel.")
-            model = NativeDDP(model, device_ids=[args.local_rank], broadcast_buffers=not args.no_ddp_bb)
+            # model = NativeDDP(model, device_ids=[args.local_rank], broadcast_buffers=not args.no_ddp_bb)
+            model = SparseDistributedDataParallel(model, device_ids=[args.local_rank], broadcast_buffers=not args.no_ddp_bb)
         # NOTE: EMA model does not need to be wrapped by DDP
 
     
+    global_memory = DGCSGDMemory(momentum=args.momentum)
+    # global_memory.initialize(model.named_parameters())
+    
+    # process_group = dist.new_group(list(range(args.world_size)))
+    # state = PowerSGDState(process_group=process_group, matrix_approximation_rank=1, start_powerSGD_iter=10, min_compression_rate=0.5)
+    # model.register_comm_hook(state, powerSGD_hook)
+    
+    # total_grad_tensor = 0
+    # for name, param in model.named_parameters():
+    #     if param.requires_grad:
+    #         total_grad_tensor += 1
+        
+    # 161 requires grad
+    # 5 buckets in this case depend on bucket size, already know this
+    id_to_size = {}
+    total_bucket = 5
     def sparse_grad(state: object, bucket: dist.GradBucket) -> torch.futures.Future[torch.Tensor]:
         fut = torch.futures.Future()
         p = bucket.buffer()
-        torch.distributed.all_reduce(p, op=torch.distributed.ReduceOp.AVG)
+        bucket_idx = str(bucket.index())
+        # if this is the first time we call this function
+        gradients = bucket.gradients()
+        parameters = bucket.parameters()
+        
+        # the first time this function is called, only 1 bucket
+        # but that is fine because it will be replaced by future calls
+        if len(id_to_size) < total_bucket:
+            if bucket_idx not in id_to_size:
+                id_to_size[bucket_idx] = len(gradients)
+            print("id_to_size", id_to_size)
+            # no compensation, no sparse
+            pre_grad_size = 0
+            for gradient in gradients:
+                torch.distributed.all_reduce(gradient, op=torch.distributed.ReduceOp.AVG)
+                p[pre_grad_size: pre_grad_size + gradient.numel()] = gradient.view(-1)
+                pre_grad_size += gradient.numel()
+        else:
+            pre_grad_size = 0
+            for gidx, gradient in enumerate(gradients):
+                pre_grad_idx = sum(id_to_size[gidx] for gidx in id_to_size if gidx < bucket_idx)
+                if not str(gidx + pre_grad_idx) in global_memory.momentums:
+                    global_memory.momentums[str(gidx + pre_grad_idx)] = torch.zeros_like(gradient)
+                    global_memory.velocities[str(gidx + pre_grad_idx)] = torch.zeros_like(gradient)
+        
+                # elementwise
+                p_compensated = global_memory.compensate(gradient, str(gidx + pre_grad_idx))
+                original_p_shape = p_compensated.shape
+                p_compensated = p_compensated.view(-1)
+                top_indices = torch.topk(torch.abs(p_compensated), int(p_compensated.numel() * args.top_k), largest=True)[1]
+                gather_indices = [torch.zeros_like(top_indices) for _ in range(args.world_size)]
+                dist.all_gather(gather_indices, top_indices)
+                unique_indices = torch.unique(torch.cat(gather_indices))
+                # print("unique_indices", unique_indices[:100], len(unique_indices))
+                global_memory.update(str(gidx + pre_grad_idx), unique_indices)
+                
+                p_sparse = torch.zeros_like(p_compensated)
+                p_sparse[unique_indices] = p_compensated[unique_indices]
+                dist.all_reduce(p_sparse, op=torch.distributed.ReduceOp.AVG)
+                p[pre_grad_size: pre_grad_size + p_sparse.numel()] = p_sparse.view(-1)
+                pre_grad_size += p_sparse.numel()
+                
         fut.set_result(p)
         return fut
 
@@ -716,8 +782,11 @@ def train_one_epoch(
             
             # sync and see the gradients
             torch.cuda.synchronize()
-            for name, param in model.named_parameters():
-                print(name, param.grad)
+            # for name, param in model.named_parameters():
+            #     if param.requires_grad:
+            #         zero_mask = torch.eq(param.grad.data, 0)
+            #         num_zeros = torch.sum(zero_mask).item()
+            #         print("num_zeros / param.grad.data.numel()", num_zeros / param.grad.data.numel())
             optimizer.step()
 
         if model_ema is not None:

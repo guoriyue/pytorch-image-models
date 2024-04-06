@@ -1057,7 +1057,6 @@ class SparseDistributedDataParallel(Module, Joinable):
         param_to_name_mapping,
         static_graph,
     ):
-        # print("ddp_init_helper")
         # should be called
         """
         DDP init helper function to manage parameters, grad hooks, logging, and SyncBatchNorm.
