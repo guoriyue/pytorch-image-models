@@ -55,7 +55,9 @@ class DGCSGDMemory(Memory):
                 mmt.add_(grad).mul_(self.momentum)
                 vec.add_(mmt).add_(grad)
             else:
+                
                 mmt.mul_(self.momentum).add_(grad)
+                # print("mmt", mmt[:100])
                 vec.add_(mmt)
             return vec
         else:

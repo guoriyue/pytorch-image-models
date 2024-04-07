@@ -525,21 +525,43 @@ def main():
                     global_memory.velocities[str(gidx + pre_grad_idx)] = torch.zeros_like(gradient)
         
                 # elementwise
-                p_compensated = global_memory.compensate(gradient, str(gidx + pre_grad_idx))
-                original_p_shape = p_compensated.shape
-                p_compensated = p_compensated.view(-1)
-                top_indices = torch.topk(torch.abs(p_compensated), int(p_compensated.numel() * args.top_k), largest=True)[1]
-                gather_indices = [torch.zeros_like(top_indices) for _ in range(args.world_size)]
-                dist.all_gather(gather_indices, top_indices)
-                unique_indices = torch.unique(torch.cat(gather_indices))
-                # print("unique_indices", unique_indices[:100], len(unique_indices))
-                global_memory.update(str(gidx + pre_grad_idx), unique_indices)
+                p_compensated = global_memory.compensate(gradient, str(gidx + pre_grad_idx), accumulate=True).view(-1).clone()
+                top_indices = torch.topk(torch.abs(p_compensated), int(p_compensated.numel() * args.top_k), largest=True, sorted=True)[1]
                 
-                p_sparse = torch.zeros_like(p_compensated)
-                p_sparse[unique_indices] = p_compensated[unique_indices]
-                dist.all_reduce(p_sparse, op=torch.distributed.ReduceOp.AVG)
-                p[pre_grad_size: pre_grad_size + p_sparse.numel()] = p_sparse.view(-1)
-                pre_grad_size += p_sparse.numel()
+                gather_indices = [torch.zeros_like(top_indices) for _ in range(args.world_size)]
+                # if args.local_rank == 0:
+                #     print("-----just_p_compensated_before", p_compensated[:1000])
+                dist.all_gather(gather_indices, top_indices)
+                # if args.local_rank == 0:
+                #     print("000just_p_compensated_before", p_compensated[:1000])
+                unique_indices = torch.unique(torch.cat(gather_indices))
+                # if args.local_rank == 0:
+                #     print("111just_p_compensated_before", p_compensated[:1000])
+                
+                
+                # if args.local_rank == 0:
+                #     print("just_p_compensated_before", p_compensated[:1000])
+                all_indices = torch.arange(p_compensated.numel()).cuda()
+                mask = torch.ones(p_compensated.numel(), dtype=torch.bool).cuda()
+                mask[unique_indices] = False
+                not_selected_indices = all_indices[mask]
+                # if args.local_rank == 0:
+                #     print("22just_p_compensated_before", p_compensated[:1000])
+                
+                # if args.local_rank == 0:
+                #     print("p_compensated_before", p_compensated[:1000])
+                #     print("not_selected_indices", not_selected_indices[:1000])
+                p_compensated[not_selected_indices] = 0
+                # if on device 0
+                # if args.local_rank == 0:
+                #     print("p_compensated_after", p_compensated[:1000])
+                # print("p_compensated", p_compensated)
+                # assert not torch.allclose(p_compensated, torch.zeros_like(p_compensated), atol=1e-3)
+                
+                dist.all_reduce(p_compensated, op=torch.distributed.ReduceOp.AVG)
+                p[pre_grad_size: pre_grad_size + p_compensated.numel()] = p_compensated.view(-1)
+                pre_grad_size += p_compensated.numel()
+                global_memory.update(str(gidx + pre_grad_idx), unique_indices)
                 
         fut.set_result(p)
         return fut
