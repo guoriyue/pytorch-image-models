@@ -804,11 +804,11 @@ def train_one_epoch(
             
             # sync and see the gradients
             torch.cuda.synchronize()
-            # for name, param in model.named_parameters():
-            #     if param.requires_grad:
-            #         zero_mask = torch.eq(param.grad.data, 0)
-            #         num_zeros = torch.sum(zero_mask).item()
-            #         print("num_zeros / param.grad.data.numel()", num_zeros / param.grad.data.numel())
+            for name, param in model.named_parameters():
+                if param.requires_grad:
+                    zero_mask = torch.eq(param.grad.data, 0)
+                    num_zeros = torch.sum(zero_mask).item()
+                    print("num_zeros / param.grad.data.numel()", num_zeros / param.grad.data.numel())
             optimizer.step()
 
         if model_ema is not None:
